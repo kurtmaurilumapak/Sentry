@@ -1,0 +1,34 @@
+{
+  "name": "sentry",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently \"vite\" \"npm run backend\"",
+    "dev:frontend": "vite",
+    "backend": "cd backend && pip install -r requirements.txt -q && python main.py",
+    "build": "vite build",
+    "preview": "vite preview",
+    "electron": "cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron ./electron/main.js",
+    "electron-dev": "concurrently \"vite\" \"npm run backend\" \"npm run electron\"",
+    "electron-build": "vite build && electron-builder"
+  },
+  "dependencies": {
+    "@mdi/font": "^7.4.47",
+    "vue": "^3.5.25",
+    "vuetify": "^3.7.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.6.0",
+    "@vitejs/plugin-vue": "^6.0.2",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^39.2.5",
+    "electron-builder": "^25.1.8",
+    "vite": "^7.2.4",
+    "vite-plugin-vue-devtools": "^8.0.5"
+  }
+}
