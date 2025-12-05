@@ -480,21 +480,44 @@ class VideoProcessor:
         
         try:
             for result in results_generator:
-                # Get the annotated frame from YOLO
-                annotated = result.plot()
-                writer.write(annotated)
-                frame_count += 1
+                # Get the original frame and draw boxes manually (same style as real-time)
+                annotated = result.orig_img.copy()
                 
-                # Count detections by class
+                # Draw bounding boxes with class + confidence only (no ID)
                 if result.boxes is not None and len(result.boxes) > 0:
-                    boxes = result.boxes
-                    for i in range(len(boxes)):
-                        cls_id = int(boxes.cls[i].item()) if boxes.cls is not None else 0
+                    boxes_data = result.boxes
+                    xyxy = boxes_data.xyxy.cpu().numpy()
+                    clss = boxes_data.cls.cpu().numpy()
+                    confs = boxes_data.conf.cpu().numpy()
+                    
+                    for i in range(len(xyxy)):
+                        x1, y1, x2, y2 = map(int, xyxy[i])
+                        cls_id = int(clss[i])
+                        conf_val = float(confs[i])
                         cls_name = self.names.get(cls_id, f"class_{cls_id}")
                         
-                        # Track unique IDs if available
-                        if boxes.id is not None:
-                            track_id = int(boxes.id[i].item())
+                        # Label: class + confidence (same as real-time tracking)
+                        label = f"{cls_name} {conf_val:.2f}"
+                        
+                        # Colors in BGR for OpenCV
+                        if cls_name.lower() == 'soldier':
+                            color = (0, 0, 255)  # RED
+                        else:
+                            color = (255, 0, 0)  # BLUE for civilian/other
+                        
+                        # Draw rectangle
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+                        
+                        # Draw label background
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                        cv2.rectangle(annotated, (x1, y1 - th - 10), (x1 + tw + 10, y1), color, -1)
+                        
+                        # Draw label text
+                        cv2.putText(annotated, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        
+                        # Track unique IDs if available (for counting)
+                        if boxes_data.id is not None:
+                            track_id = int(boxes_data.id[i].item())
                             if cls_name not in track_ids_seen:
                                 track_ids_seen[cls_name] = set()
                             track_ids_seen[cls_name].add(track_id)
@@ -503,6 +526,9 @@ class VideoProcessor:
                             if cls_name not in detection_counts:
                                 detection_counts[cls_name] = 0
                             detection_counts[cls_name] += 1
+                
+                writer.write(annotated)
+                frame_count += 1
                 
                 # Report progress
                 if progress_cb:

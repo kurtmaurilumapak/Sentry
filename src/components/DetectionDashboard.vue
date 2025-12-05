@@ -171,6 +171,7 @@ async function analyzeVideo(videoFile, videoId = null) {
     // Set the analyzed video URL
     analyzedVideoUrl.value = processedUrl;
     previewUrl.value = processedUrl;
+    errorMsg.value = '';  // Clear any YouTube errors since analyzed video is ready
     
     loadingMessage.value = '';
   } catch (e) {
@@ -462,7 +463,8 @@ function onVideoSeeked() {
 
 function onVideoError(e) {
   console.error('Video error:', e);
-  if (isYouTubeVideo.value) {
+  // Don't show error if we have an analyzed video playing successfully
+  if (isYouTubeVideo.value && !analyzedVideoUrl.value) {
     errorMsg.value = 'Cannot play YouTube video directly. Some videos have restrictions.';
   }
 }
