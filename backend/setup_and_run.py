@@ -6,6 +6,7 @@ then starts the backend server.
 import subprocess
 import sys
 import os
+import shutil
 
 def print_header():
     """Print setup header."""
@@ -118,6 +119,178 @@ def check_dependencies():
     except ImportError:
         return False
 
+
+def check_ffmpeg():
+    """Check if FFmpeg is installed (system or imageio_ffmpeg package)."""
+    # Check system PATH first
+    if shutil.which("ffmpeg"):
+        return True
+    
+    # Check imageio_ffmpeg package
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+            return True
+    except (ImportError, Exception):
+        pass
+    
+    return False
+
+
+def get_ffmpeg_path():
+    """Get FFmpeg path from system or imageio_ffmpeg."""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, Exception):
+        return None
+
+
+def install_ffmpeg():
+    """Attempt to install FFmpeg automatically."""
+    print("[*] FFmpeg not found - attempting automatic installation...")
+    print()
+    
+    # Method 1: Try installing imageio-ffmpeg Python package (cross-platform, no admin needed)
+    print("[*] Installing imageio-ffmpeg package (bundled FFmpeg)...")
+    print("-" * 60)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"],
+            timeout=120
+        )
+        print("-" * 60)
+        if result.returncode == 0:
+            # Verify installation
+            try:
+                import importlib
+                import imageio_ffmpeg
+                importlib.reload(imageio_ffmpeg)
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+                    print(f"[OK] FFmpeg installed via imageio-ffmpeg: {ffmpeg_exe}")
+                    print()
+                    return True
+            except Exception as e:
+                print(f"[WARNING] imageio-ffmpeg installed but couldn't verify: {e}")
+    except subprocess.TimeoutExpired:
+        print("[WARNING] pip install timed out")
+    except Exception as e:
+        print(f"[WARNING] pip install failed: {e}")
+    print()
+    
+    # Method 2: Try system package managers (Windows only)
+    if sys.platform != "win32":
+        print("[INFO] For system FFmpeg installation:")
+        print("   - macOS: brew install ffmpeg")
+        print("   - Ubuntu/Debian: sudo apt install ffmpeg")
+        print("   - Fedora: sudo dnf install ffmpeg")
+        print()
+        return False
+    
+    # Try different installation methods on Windows
+    install_methods = [
+        # Method 1: winget (Windows 10/11)
+        {
+            "name": "winget",
+            "check": ["winget", "--version"],
+            "install": ["winget", "install", "-e", "--id", "Gyan.FFmpeg", "--accept-package-agreements", "--accept-source-agreements"],
+        },
+        # Method 2: choco (if installed)
+        {
+            "name": "Chocolatey",
+            "check": ["choco", "--version"],
+            "install": ["choco", "install", "ffmpeg", "-y"],
+        },
+        # Method 3: scoop (if installed)
+        {
+            "name": "Scoop",
+            "check": ["scoop", "--version"],
+            "install": ["scoop", "install", "ffmpeg"],
+        },
+    ]
+    
+    for method in install_methods:
+        # Check if package manager is available
+        try:
+            result = subprocess.run(
+                method["check"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                continue
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        
+        # Package manager found, try to install
+        print(f"[*] Found {method['name']} - installing FFmpeg...")
+        print("-" * 60)
+        
+        try:
+            result = subprocess.run(
+                method["install"],
+                timeout=300  # 5 minute timeout
+            )
+            print("-" * 60)
+            
+            if result.returncode == 0:
+                # Verify installation
+                # Need to refresh PATH on Windows
+                if check_ffmpeg():
+                    print("[OK] FFmpeg installed successfully!")
+                    print()
+                    return True
+                else:
+                    # FFmpeg might be installed but not in current PATH
+                    # Try common locations
+                    common_paths = [
+                        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+                        os.path.expandvars(r"%USERPROFILE%\scoop\shims"),
+                        r"C:\ProgramData\chocolatey\bin",
+                        r"C:\ffmpeg\bin",
+                    ]
+                    for path in common_paths:
+                        ffmpeg_exe = os.path.join(path, "ffmpeg.exe")
+                        if os.path.exists(ffmpeg_exe):
+                            print(f"[OK] FFmpeg installed at: {path}")
+                            print("[INFO] You may need to restart your terminal for FFmpeg to be in PATH")
+                            print()
+                            return True
+                    
+                    print("[OK] FFmpeg installed - restart terminal to use")
+                    print()
+                    return True
+            else:
+                print(f"[WARNING] {method['name']} installation failed")
+                continue
+                
+        except subprocess.TimeoutExpired:
+            print(f"[WARNING] {method['name']} installation timed out")
+            continue
+        except Exception as e:
+            print(f"[WARNING] {method['name']} installation error: {e}")
+            continue
+    
+    # No package manager worked
+    print("[WARNING] Could not auto-install FFmpeg")
+    print()
+    print("   Please install FFmpeg manually:")
+    print("   1. Download from: https://ffmpeg.org/download.html")
+    print("   2. Or run in PowerShell (as Admin): winget install ffmpeg")
+    print("   3. Or install Chocolatey and run: choco install ffmpeg")
+    print()
+    print("   Video analysis will work but videos won't play in browser")
+    print("   until FFmpeg is installed.")
+    print()
+    return False
+
 def install_dependencies():
     """Install dependencies with progress indicator."""
     print("[*] Checking dependencies...")
@@ -221,6 +394,15 @@ def main():
     if not install_dependencies():
         print("Failed to install dependencies. Exiting.")
         sys.exit(1)
+    
+    # Check and install FFmpeg for video analysis
+    print("[*] Checking FFmpeg for video analysis...")
+    if check_ffmpeg():
+        ffmpeg_path = get_ffmpeg_path()
+        print(f"[OK] FFmpeg found: {ffmpeg_path}")
+        print()
+    else:
+        install_ffmpeg()
     
     # Start the backend
     print("[*] Starting backend server...")

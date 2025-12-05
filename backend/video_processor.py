@@ -7,6 +7,9 @@ Supports multiple model selection.
 import cv2
 import os
 import base64
+import shutil
+import subprocess
+import tempfile
 import numpy as np
 import torch
 
@@ -49,6 +52,33 @@ def detect_device():
 DEVICE, DEVICE_NAME, HAS_GPU = detect_device()
 print(f"  Device: {DEVICE} ({DEVICE_NAME})")
 
+# Check FFmpeg availability for video analysis feature
+def get_ffmpeg_path():
+    """Get FFmpeg path - check system PATH first, then imageio_ffmpeg package."""
+    # Check system PATH first
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    
+    # Check imageio_ffmpeg package (bundled FFmpeg)
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_exe and os.path.exists(ffmpeg_exe):
+            return ffmpeg_exe
+    except (ImportError, Exception):
+        pass
+    
+    return None
+
+FFMPEG_PATH = get_ffmpeg_path()
+if FFMPEG_PATH:
+    print(f"✓ FFmpeg found: {FFMPEG_PATH}")
+else:
+    print("⚠ FFmpeg NOT found - video analysis will produce non-playable videos!")
+    print("  Install: pip install imageio-ffmpeg")
+    print("  Or install system FFmpeg: https://ffmpeg.org/download.html")
+
 
 class VideoProcessor:
     """
@@ -68,6 +98,10 @@ class VideoProcessor:
         # Allow tuning image size for low-VRAM GPUs/CPU via env
         self.gpu_imgsz = int(os.getenv("SENTRY_GPU_IMGSZ", "640"))
         self.cpu_imgsz = int(os.getenv("SENTRY_CPU_IMGSZ", "480"))
+        # Inference parameters
+        self.conf_threshold = float(os.getenv("SENTRY_CONF_THRESHOLD", "0.25"))
+        self.iou_threshold = float(os.getenv("SENTRY_IOU_THRESHOLD", "0.45"))
+        self.max_det = int(os.getenv("SENTRY_MAX_DET", "300"))
         
         # Load default model
         self.load_model(DEFAULT_MODEL)
@@ -336,6 +370,229 @@ class VideoProcessor:
         annotated_base64 = base64.b64encode(buffer).decode('utf-8')
         
         return annotated_base64, detections
+
+    def process_video_file(self, input_path: str, output_path: str, conf: float = 0.25, progress_cb=None) -> dict:
+        """
+        Process an entire video file using YOLO's native video processing.
+        Returns metadata with frame_count and fps.
+        """
+        if not self.model:
+            self.load_model()
+        
+        # Get video info first
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_path}")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        
+        out_dir = os.path.dirname(output_path)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        
+        # Use YOLO's built-in tracking with save - it handles video encoding properly
+        # Create a temp directory for YOLO output
+        temp_dir = tempfile.mkdtemp(prefix="yolo_output_")
+        
+        print(f"Processing video with YOLO tracking: {input_path}")
+        print(f"Total frames: {total_frames}, FPS: {fps}, Resolution: {width}x{height}")
+        
+        # Track progress by processing in chunks
+        frame_count = 0
+        
+        # Use stream=True to process frame by frame for progress tracking
+        tracker_cfg = "bytetrack.yaml"
+        results_generator = self.model.track(
+            source=input_path,
+            conf=conf,
+            iou=self.iou_threshold,
+            max_det=self.max_det,
+            tracker=tracker_cfg,
+            stream=True,
+            verbose=False,
+        )
+        
+        # Check FFmpeg availability first (system or imageio_ffmpeg)
+        ffmpeg_path = get_ffmpeg_path()
+        print(f"FFmpeg available: {ffmpeg_path is not None}")
+        
+        # Choose codec based on FFmpeg availability
+        if ffmpeg_path:
+            # Will re-encode with FFmpeg, use any codec for temp
+            temp_output = os.path.join(temp_dir, "output.avi")
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        else:
+            # No FFmpeg - try to write browser-compatible format directly
+            temp_output = output_path  # Write directly to output
+            # Try H264 first (available in some OpenCV builds)
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            print("No FFmpeg - trying avc1 codec directly...")
+        
+        writer = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+        
+        # If avc1 failed, try mp4v
+        if not writer.isOpened() and not ffmpeg_path:
+            print("avc1 codec not available, trying mp4v...")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+        
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to create video writer for {temp_output}")
+        
+        # Track detection counts
+        detection_counts = {}  # class_name -> count of unique track IDs
+        track_ids_seen = {}    # class_name -> set of track IDs
+        
+        try:
+            for result in results_generator:
+                # Get the annotated frame from YOLO
+                annotated = result.plot()
+                writer.write(annotated)
+                frame_count += 1
+                
+                # Count detections by class
+                if result.boxes is not None and len(result.boxes) > 0:
+                    boxes = result.boxes
+                    for i in range(len(boxes)):
+                        cls_id = int(boxes.cls[i].item()) if boxes.cls is not None else 0
+                        cls_name = self.names.get(cls_id, f"class_{cls_id}")
+                        
+                        # Track unique IDs if available
+                        if boxes.id is not None:
+                            track_id = int(boxes.id[i].item())
+                            if cls_name not in track_ids_seen:
+                                track_ids_seen[cls_name] = set()
+                            track_ids_seen[cls_name].add(track_id)
+                        else:
+                            # No tracking, just count detections
+                            if cls_name not in detection_counts:
+                                detection_counts[cls_name] = 0
+                            detection_counts[cls_name] += 1
+                
+                # Report progress
+                if progress_cb:
+                    try:
+                        progress_cb(frame_count, total_frames)
+                    except Exception:
+                        pass
+                
+                # Print progress every 50 frames
+                if frame_count % 50 == 0:
+                    percent = int((frame_count / total_frames) * 100) if total_frames > 0 else 0
+                    print(f"video 1/1 ({frame_count}/{total_frames}) {percent}%")
+        finally:
+            writer.release()
+        
+        # Finalize detection counts (unique track IDs or raw counts)
+        for cls_name, ids in track_ids_seen.items():
+            detection_counts[cls_name] = len(ids)
+        
+        print(f"Detection summary: {detection_counts}")
+        
+        print(f"Frame processing complete: {frame_count} frames")
+        
+        # Check temp file
+        if os.path.exists(temp_output):
+            temp_size = os.path.getsize(temp_output) / (1024 * 1024)  # MB
+            print(f"Temp video size: {temp_size:.1f} MB")
+        
+        # Update progress to encoding stage
+        if progress_cb:
+            try:
+                progress_cb(frame_count, total_frames, "encoding")
+            except TypeError:
+                # Old callback signature
+                progress_cb(frame_count, total_frames)
+        
+        # Re-encode to H.264 for browser compatibility using FFmpeg
+        if ffmpeg_path and os.path.exists(temp_output) and temp_output != output_path:
+            try:
+                print(f"Re-encoding to H.264 with FFmpeg...")
+                print(f"FFmpeg: {ffmpeg_path}")
+                
+                # Use ultrafast preset for speed, reasonable quality
+                cmd = [
+                    ffmpeg_path, "-y", 
+                    "-i", temp_output,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",  # Fastest encoding
+                    "-crf", "28",  # Slightly lower quality for speed
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    output_path
+                ]
+                
+                print(f"Running: {' '.join(cmd)}")
+                
+                # Run with timeout (10 minutes max)
+                proc_result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+                
+                if proc_result.returncode != 0:
+                    print(f"FFmpeg stderr: {proc_result.stderr[:500] if proc_result.stderr else 'none'}")
+                    # Try even simpler command without faststart
+                    print("Trying simpler FFmpeg command...")
+                    cmd_simple = [
+                        ffmpeg_path, "-y", 
+                        "-i", temp_output,
+                        "-c:v", "libx264",
+                        "-preset", "ultrafast",
+                        "-pix_fmt", "yuv420p",
+                        output_path
+                    ]
+                    proc_result = subprocess.run(
+                        cmd_simple, 
+                        capture_output=True, 
+                        text=True,
+                        timeout=600
+                    )
+                    if proc_result.returncode != 0:
+                        raise Exception(proc_result.stderr[:500] if proc_result.stderr else "Unknown error")
+                
+                # Verify output
+                if os.path.exists(output_path):
+                    out_size = os.path.getsize(output_path) / (1024 * 1024)
+                    print(f"Video re-encoded successfully: {output_path} ({out_size:.1f} MB)")
+                else:
+                    raise Exception("Output file not created")
+                    
+            except subprocess.TimeoutExpired:
+                print(f"FFmpeg encoding timed out after 10 minutes!")
+                print(f"Falling back to original format...")
+                shutil.copy2(temp_output, output_path)
+            except Exception as e:
+                print(f"FFmpeg encoding failed: {e}")
+                shutil.copy2(temp_output, output_path)
+                print(f"WARNING: Using non-H264 codec - video may not play in browser!")
+        elif not ffmpeg_path:
+            print(f"WARNING: FFmpeg not installed - video may not play in browser!")
+            print(f"Install FFmpeg: https://ffmpeg.org/download.html")
+        else:
+            print(f"FFmpeg not found - video may not play in browser")
+            shutil.copy2(temp_output, output_path)
+        
+        # Cleanup temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+        
+        return {
+            "frame_count": frame_count,
+            "total_frames": total_frames or frame_count,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "detection_counts": detection_counts
+        }
 
 
 # Global instance

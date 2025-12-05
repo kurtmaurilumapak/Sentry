@@ -4,9 +4,10 @@ import io
 import os
 import base64
 import tempfile
+import uuid
 import cv2
 import numpy as np
-from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect, Form, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from PIL import Image
@@ -186,8 +187,10 @@ async def websocket_track(websocket: WebSocket):
         traceback.print_exc()
 
 
-# Store downloaded YouTube videos
+# Store downloaded YouTube videos and processed videos
 youtube_videos = {}
+processed_videos = {}
+processing_progress = {}
 
 @router.post("/youtube/prepare")
 async def prepare_youtube(request: YouTubeRequest):
@@ -283,4 +286,128 @@ async def serve_youtube_video(video_id: str):
             "Access-Control-Allow-Headers": "*",
         }
     )
+
+
+def run_video_analysis(proc_id: str, input_path: str, output_path: str, title: str):
+    """Background task to process video."""
+    def progress_cb(done: int, total: int, stage: str = "analyzing"):
+        processing_progress[proc_id]["processed"] = done
+        processing_progress[proc_id]["stage"] = stage
+        if total:
+            processing_progress[proc_id]["total"] = total
+    
+    try:
+        print(f"Analyzing video: {title}")
+        processing_progress[proc_id]["stage"] = "analyzing"
+        meta = video_processor.process_video_file(input_path, output_path, progress_cb=progress_cb)
+        processed_videos[proc_id] = {
+            "path": output_path,
+            "title": f"{title}_analyzed",
+            "meta": meta,
+        }
+        processing_progress[proc_id]["status"] = "done"
+        processing_progress[proc_id]["processed"] = meta.get("frame_count", 0)
+        processing_progress[proc_id]["total"] = meta.get("total_frames", 0)
+        processing_progress[proc_id]["stage"] = "complete"
+        processing_progress[proc_id]["detection_counts"] = meta.get("detection_counts", {})
+        print(f"Video analysis complete: {meta['frame_count']} frames")
+        print(f"Detection counts: {meta.get('detection_counts', {})}")
+    except Exception as e:
+        print(f"Video analysis error: {e}")
+        import traceback
+        traceback.print_exc()
+        processing_progress[proc_id]["status"] = "error"
+        processing_progress[proc_id]["error"] = str(e)
+        processing_progress[proc_id]["stage"] = "error"
+
+
+@router.post("/video/analyze")
+async def analyze_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(None),
+    video_id: str = Form(None)
+):
+    """
+    Analyze a full video and return a processed video URL with bounding boxes.
+    - If video_id is provided, use a previously downloaded YouTube video.
+    - Otherwise, accept an uploaded file.
+    Returns immediately and processes in background.
+    """
+    input_path = None
+    title = "video"
+    
+    # Use existing YouTube download
+    if video_id:
+        if video_id not in youtube_videos:
+            return {"error": "Video not found"}
+        info = youtube_videos[video_id]
+        input_path = info['path']
+        title = info.get('title', 'video')
+    elif file is not None:
+        # Save uploaded file to temp path
+        tmp_dir = tempfile.mkdtemp(prefix="upload_")
+        input_path = os.path.join(tmp_dir, file.filename or "video.mp4")
+        contents = await file.read()
+        with open(input_path, "wb") as f:
+            f.write(contents)
+        title = file.filename or "video"
+    else:
+        return {"error": "No video provided"}
+    
+    if not os.path.exists(input_path):
+        return {"error": "Input video not found"}
+    
+    # Prepare output path
+    proc_id = str(uuid.uuid4())
+    out_dir = tempfile.mkdtemp(prefix="analyzed_")
+    output_path = os.path.join(out_dir, "analyzed.mp4")
+    
+    # Initialize progress
+    processing_progress[proc_id] = {
+        "status": "processing",
+        "processed": 0,
+        "total": None,
+        "error": None,
+    }
+    
+    # Start background processing
+    background_tasks.add_task(run_video_analysis, proc_id, input_path, output_path, title)
+    
+    # Return immediately with the process ID
+    return {
+        "status": "processing",
+        "processed_id": proc_id,
+        "processed_url": f"/video/analyzed/{proc_id}",
+    }
+
+
+@router.get("/video/analyzed/{proc_id}")
+async def serve_analyzed_video(proc_id: str):
+    """Serve analyzed video with CORS headers."""
+    if proc_id not in processed_videos:
+        return {"error": "Analyzed video not found"}
+    
+    info = processed_videos[proc_id]
+    path = info['path']
+    if not os.path.exists(path):
+        return {"error": "Analyzed video file missing"}
+    
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=f"{info.get('title', 'analyzed')}.mp4",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+
+@router.get("/video/analyze/status/{proc_id}")
+async def analyze_video_status(proc_id: str):
+    """Get analysis progress for a video."""
+    if proc_id not in processing_progress:
+        return {"error": "Not found"}
+    return processing_progress[proc_id]
 

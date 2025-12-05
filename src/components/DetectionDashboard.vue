@@ -23,7 +23,6 @@ let trackingInterval = null;
 
 const isVideo = computed(() => file.value?.type?.startsWith('video/') || isYouTubeVideo.value);
 const isImage = computed(() => file.value?.type?.startsWith('image/'));
-const hasMedia = computed(() => !!previewUrl.value);
 
 // YouTube support
 const youtubeUrl = ref('');
@@ -37,6 +36,16 @@ const isChangingModel = ref(false);
 
 // Device info
 const deviceInfo = ref({ name: 'Detecting...', has_gpu: false });
+
+// Analyze video mode (pre-process entire video)
+const analyzeMode = ref(false);
+const isAnalyzing = ref(false);
+const analyzeProgress = ref({ processed: 0, total: 0, percent: 0 });
+const analyzedVideoUrl = ref('');
+let analyzeStatusTimer = null;
+
+// hasMedia - shows results section when we have media OR when analyzing
+const hasMedia = computed(() => !!previewUrl.value || (file.value && (isProcessing.value || isAnalyzing.value)));
 
 async function loadDeviceInfo() {
   try {
@@ -116,6 +125,7 @@ async function checkBackendStatus() {
 
 function clearMedia() {
   stopTracking(true); // Close WebSocket for new video
+  stopAnalyzePolling();
   isWarmedUp = false;
   if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
   file.value = null;
@@ -123,8 +133,121 @@ function clearMedia() {
   detections.value = [];
   errorMsg.value = '';
   annotatedFrameUrl.value = '';
+  analyzedVideoUrl.value = '';
   isYouTubeVideo.value = false;
   youtubeUrl.value = '';
+  isAnalyzing.value = false;
+  analyzeProgress.value = { processed: 0, total: 0, percent: 0 };
+}
+
+// Video analysis functions
+async function analyzeVideo(videoFile, videoId = null) {
+  isAnalyzing.value = true;
+  loadingMessage.value = 'Starting video analysis...';
+  analyzeProgress.value = { processed: 0, total: 0, percent: 0 };
+  
+  try {
+    const formData = new FormData();
+    if (videoFile) formData.append('file', videoFile);
+    if (videoId) formData.append('video_id', videoId);
+    
+    const response = await fetch(`${BACKEND_BASE}/video/analyze`, {
+      method: 'POST',
+      body: formData
+    });
+    
+    const data = await response.json();
+    if (data.error) throw new Error(data.error);
+    
+    // Store the processed URL for later
+    const processedUrl = `${BACKEND_BASE}${data.processed_url}`;
+    
+    // Start polling for progress immediately
+    startAnalyzePolling(data.processed_id);
+    
+    // Wait for completion
+    await waitForAnalysis(data.processed_id);
+    
+    // Set the analyzed video URL
+    analyzedVideoUrl.value = processedUrl;
+    previewUrl.value = processedUrl;
+    
+    loadingMessage.value = '';
+  } catch (e) {
+    errorMsg.value = e.message;
+    loadingMessage.value = '';
+  } finally {
+    isAnalyzing.value = false;
+    stopAnalyzePolling();
+  }
+}
+
+function startAnalyzePolling(procId) {
+  stopAnalyzePolling();
+  analyzeStatusTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${BACKEND_BASE}/video/analyze/status/${procId}`);
+      const data = await res.json();
+      if (data.error) return;
+      
+      const { processed = 0, total = 0, status = 'processing', stage = 'analyzing', detection_counts = {} } = data;
+      const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+      analyzeProgress.value = { processed, total, percent, status, stage, detection_counts };
+      
+      if (stage === 'encoding') {
+        loadingMessage.value = 'Encoding video for browser playback...';
+      } else {
+        loadingMessage.value = `Analyzing video... ${percent}% (${processed}/${total} frames)`;
+      }
+      
+      // Update detection counts when analysis is done
+      if (status === 'done' && detection_counts) {
+        // Convert detection_counts to detections array format for display
+        const detectionsList = [];
+        for (const [className, count] of Object.entries(detection_counts)) {
+          for (let i = 0; i < count; i++) {
+            detectionsList.push({ class: className });
+          }
+        }
+        detections.value = detectionsList;
+      }
+      
+      if (status !== 'processing') {
+        stopAnalyzePolling();
+      }
+    } catch (e) {
+      console.error('Progress polling error:', e);
+    }
+  }, 500);
+}
+
+function stopAnalyzePolling() {
+  if (analyzeStatusTimer) {
+    clearInterval(analyzeStatusTimer);
+    analyzeStatusTimer = null;
+  }
+}
+
+async function waitForAnalysis(procId) {
+  return new Promise((resolve, reject) => {
+    const checkStatus = async () => {
+      try {
+        const res = await fetch(`${BACKEND_BASE}/video/analyze/status/${procId}`);
+        const data = await res.json();
+        
+        if (data.status === 'done') {
+          resolve(data);
+        } else if (data.status === 'error') {
+          reject(new Error(data.error || 'Analysis failed'));
+        } else {
+          setTimeout(checkStatus, 500);
+        }
+      } catch (e) {
+        reject(e);
+      }
+    };
+    checkStatus();
+  });
 }
 
 async function resetTracker() {
@@ -306,12 +429,16 @@ async function warmupModel() {
 // Video events
 function onVideoLoadedData() {
   console.log('Video loaded, warming up...');
+  // Skip warmup for analyzed videos
+  if (analyzedVideoUrl.value) return;
   // Small delay to ensure video is ready
   setTimeout(warmupModel, 200);
 }
 
 function onVideoPlay() {
   console.log('Video play');
+  // Skip live tracking for pre-analyzed videos
+  if (analyzedVideoUrl.value) return;
   startTracking();
 }
 
@@ -409,11 +536,26 @@ async function loadYouTube() {
       isYouTubeVideo.value = true;
       youtubeUrl.value = '';
       annotatedFrameUrl.value = '';
+      analyzedVideoUrl.value = '';
       detections.value = [];
       
       await resetTracker();
       
-      previewUrl.value = `${BACKEND_BASE}${data.proxy_url}`;
+      // If analyze mode is on, process the video first
+      if (analyzeMode.value) {
+        isProcessing.value = true;
+        try {
+          await analyzeVideo(null, data.video_id);
+        } catch (err) {
+          errorMsg.value = err.message;
+          // Fallback to normal playback
+          previewUrl.value = `${BACKEND_BASE}${data.proxy_url}`;
+        } finally {
+          isProcessing.value = false;
+        }
+      } else {
+        previewUrl.value = `${BACKEND_BASE}${data.proxy_url}`;
+      }
       loadingMessage.value = '';
     }
   } catch (err) {
@@ -443,10 +585,25 @@ async function handleFile(selectedFile) {
   
   file.value = selectedFile;
   annotatedFrameUrl.value = '';
+  analyzedVideoUrl.value = '';
   detections.value = [];
   errorMsg.value = '';
   
-  previewUrl.value = URL.createObjectURL(selectedFile);
+  // If analyze mode is on for video, process the entire video first
+  if (analyzeMode.value && isVid) {
+    isProcessing.value = true;
+    try {
+      await analyzeVideo(selectedFile);
+    } catch (err) {
+      errorMsg.value = err.message;
+      // Fallback to normal playback
+      previewUrl.value = URL.createObjectURL(selectedFile);
+    } finally {
+      isProcessing.value = false;
+    }
+  } else {
+    previewUrl.value = URL.createObjectURL(selectedFile);
+  }
   
   if (isImg) {
     isProcessing.value = true;
@@ -477,6 +634,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => {
   stopTracking(true);
+  stopAnalyzePolling();
   if (previewUrl.value) URL.revokeObjectURL(previewUrl.value);
 });
 </script>
@@ -513,6 +671,19 @@ onBeforeUnmount(() => {
               {{ model.name }}{{ !model.available ? ' (not found)' : '' }}
             </option>
           </select>
+        </div>
+        
+        <!-- Analyze Video Toggle -->
+        <div class="analyze-toggle" :class="{ active: analyzeMode }">
+          <label class="toggle-switch">
+            <input 
+              type="checkbox" 
+              v-model="analyzeMode"
+              :disabled="isTracking || isAnalyzing || hasMedia"
+            />
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="toggle-label">Analyze Video</span>
         </div>
         
         <div class="status-badge" :class="backendStatus">
@@ -574,14 +745,17 @@ onBeforeUnmount(() => {
             <button class="back-btn" @click="clearMedia">← New Upload</button>
             <div class="stats">
               <span v-if="isTracking" class="live"><span class="pulse"></span> LIVE</span>
-              <span class="soldier-count">
-                <span class="dot red"></span>
-                soldier: {{ detections.filter(d => d.class === 'soldier').length }}
-              </span>
-              <span class="civilian-count">
-                <span class="dot blue"></span>
-                civilian: {{ detections.filter(d => d.class === 'civilian').length }}
-              </span>
+              <span v-if="analyzedVideoUrl && !isTracking" class="analyzed-badge">📊 ANALYZED</span>
+              <template v-if="!analyzedVideoUrl || isTracking">
+                <span class="soldier-count">
+                  <span class="dot red"></span>
+                  soldier: {{ detections.filter(d => d.class === 'soldier').length }}
+                </span>
+                <span class="civilian-count">
+                  <span class="dot blue"></span>
+                  civilian: {{ detections.filter(d => d.class === 'civilian').length }}
+                </span>
+              </template>
             </div>
           </div>
 
@@ -625,12 +799,7 @@ onBeforeUnmount(() => {
               alt="Detected"
             />
 
-            <div v-if="isProcessing" class="loading">
-              <div class="spinner"></div>
-              <p>{{ loadingMessage }}</p>
-            </div>
-            
-            <div v-if="isVideo && !isTracking && !annotatedFrameUrl" class="play-hint">
+            <div v-if="isVideo && !isTracking && !annotatedFrameUrl && !analyzedVideoUrl && !isAnalyzing" class="play-hint">
               ▶ Press play to start tracking
             </div>
           </div>
@@ -639,6 +808,27 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </main>
+
+    <!-- Full page analyzing overlay -->
+    <div v-if="isAnalyzing || (isProcessing && isImage)" class="analyze-overlay">
+      <div class="analyze-modal">
+        <div class="analyze-icon">{{ isAnalyzing ? '🎬' : '🖼️' }}</div>
+        <h2>{{ isAnalyzing ? 'Analyzing Video' : 'Processing Image' }}</h2>
+        <div v-if="isAnalyzing" class="analyze-progress-container">
+          <div class="analyze-progress-bar">
+            <div class="analyze-progress-fill" :style="{ width: analyzeProgress.percent + '%' }"></div>
+          </div>
+          <div class="analyze-percent">{{ analyzeProgress.percent }}%</div>
+        </div>
+        <p v-if="isAnalyzing" class="analyze-details">
+          Processing frame {{ analyzeProgress.processed }} of {{ analyzeProgress.total }}
+        </p>
+        <p v-else class="analyze-details">
+          Running object detection...
+        </p>
+        <div class="analyze-spinner"></div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -772,6 +962,83 @@ onBeforeUnmount(() => {
 }
 
 .model-selector select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.analyze-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+
+.analyze-toggle.active {
+  border-color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.toggle-label {
+  font-size: 12px;
+  color: #888;
+  white-space: nowrap;
+}
+
+.analyze-toggle.active .toggle-label {
+  color: #f59e0b;
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #333;
+  transition: 0.3s;
+  border-radius: 20px;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background-color: #666;
+  transition: 0.3s;
+  border-radius: 50%;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: #f59e0b;
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(16px);
+  background-color: #fff;
+}
+
+.toggle-switch input:disabled + .toggle-slider {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -1004,6 +1271,14 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
+.analyzed-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #f59e0b;
+  font-weight: 600;
+}
+
 .pulse {
   width: 8px;
   height: 8px;
@@ -1029,6 +1304,9 @@ onBeforeUnmount(() => {
 .video-element {
   max-width: 100%;
   max-height: 70vh;
+  min-width: 640px;
+  min-height: 360px;
+  background: #111;
 }
 
 .video-element.hidden {
@@ -1079,10 +1357,122 @@ onBeforeUnmount(() => {
   font-size: 16px;
 }
 
+.play-hint.analyzed {
+  color: #f59e0b;
+}
+
+.progress-bar {
+  width: 200px;
+  height: 6px;
+  background: #333;
+  border-radius: 3px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
 .error {
   padding: 12px 16px;
   background: rgba(239, 68, 68, 0.1);
   color: #ef4444;
   font-size: 14px;
+}
+
+/* Full page analyze overlay */
+.analyze-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.analyze-modal {
+  background: linear-gradient(145deg, #1a1a2e, #16213e);
+  border: 1px solid #333;
+  border-radius: 20px;
+  padding: 48px 64px;
+  text-align: center;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+}
+
+.analyze-icon {
+  font-size: 64px;
+  margin-bottom: 16px;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.1); opacity: 0.8; }
+}
+
+.analyze-modal h2 {
+  font-size: 28px;
+  font-weight: 600;
+  color: #fff;
+  margin: 0 0 24px 0;
+}
+
+.analyze-progress-container {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.analyze-progress-bar {
+  flex: 1;
+  width: 300px;
+  height: 12px;
+  background: #333;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.analyze-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #f59e0b, #fbbf24);
+  border-radius: 6px;
+  transition: width 0.3s ease;
+}
+
+.analyze-percent {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fbbf24;
+  min-width: 80px;
+}
+
+.analyze-details {
+  color: #888;
+  font-size: 14px;
+  margin: 0 0 24px 0;
+}
+
+.analyze-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid #333;
+  border-top-color: #fbbf24;
+  border-radius: 50%;
+  margin: 0 auto;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 </style>
