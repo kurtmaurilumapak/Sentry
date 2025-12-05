@@ -27,6 +27,16 @@ def detect_device():
         gpu_name = torch.cuda.get_device_name(0)
         print(f"✓ NVIDIA GPU detected: {gpu_name}")
         print(f"  CUDA version: {torch.version.cuda}")
+        
+        # Configure memory allocation to prevent fragmentation
+        try:
+            # Use expandable segments to reduce fragmentation
+            os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+            # Limit memory fraction to leave headroom for system
+            torch.cuda.set_per_process_memory_fraction(0.85)
+        except Exception as e:
+            print(f"  Note: Could not set memory config: {e}")
+        
         return 'cuda:0', gpu_name, True
     
     # Check for Apple MPS (Metal Performance Shaders)
@@ -51,6 +61,16 @@ def detect_device():
 # Detect device at startup
 DEVICE, DEVICE_NAME, HAS_GPU = detect_device()
 print(f"  Device: {DEVICE} ({DEVICE_NAME})")
+
+
+def clear_gpu_memory():
+    """Clear GPU memory cache to prevent OOM errors."""
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
 # Check FFmpeg availability for video analysis feature
 def get_ffmpeg_path():
@@ -343,6 +363,8 @@ class VideoProcessor:
         
         return im0, detections
     
+    _frame_counter = 0  # Class-level counter for periodic memory cleanup
+    
     def process_frame_base64(self, frame_base64: str, conf: float = 0.25) -> tuple:
         """
         Process a base64 encoded frame.
@@ -369,6 +391,11 @@ class VideoProcessor:
         _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         annotated_base64 = base64.b64encode(buffer).decode('utf-8')
         
+        # Periodically clear GPU memory to prevent buildup during live tracking
+        VideoProcessor._frame_counter += 1
+        if self.has_gpu and VideoProcessor._frame_counter % 200 == 0:
+            clear_gpu_memory()
+        
         return annotated_base64, detections
 
     def process_video_file(self, input_path: str, output_path: str, conf: float = 0.25, progress_cb=None) -> dict:
@@ -376,6 +403,10 @@ class VideoProcessor:
         Process an entire video file using YOLO's native video processing.
         Returns metadata with frame_count and fps.
         """
+        # Clear GPU memory before starting to maximize available VRAM
+        if self.has_gpu:
+            clear_gpu_memory()
+        
         if not self.model:
             self.load_model()
         
@@ -484,6 +515,24 @@ class VideoProcessor:
                 if frame_count % 50 == 0:
                     percent = int((frame_count / total_frames) * 100) if total_frames > 0 else 0
                     print(f"video 1/1 ({frame_count}/{total_frames}) {percent}%")
+                
+                # Clear GPU memory periodically to prevent OOM on long videos
+                if self.has_gpu and frame_count % 100 == 0:
+                    clear_gpu_memory()
+                    
+        except torch.cuda.OutOfMemoryError:
+            print("CUDA OOM during video processing - clearing memory and retrying on CPU...")
+            writer.release()
+            clear_gpu_memory()
+            # Fall back to CPU mode
+            self.has_gpu = False
+            self.device = 'cpu'
+            self.device_name = 'CPU (OOM fallback)'
+            # Reload model on CPU
+            if self.current_model_id:
+                self.load_model(self.current_model_id)
+            # Re-raise to let caller handle retry
+            raise RuntimeError("Out of GPU memory - please try again (now using CPU)")
         finally:
             writer.release()
         
@@ -584,6 +633,10 @@ class VideoProcessor:
             shutil.rmtree(temp_dir)
         except Exception:
             pass
+        
+        # Clear GPU memory after processing to free up VRAM
+        if self.has_gpu:
+            clear_gpu_memory()
         
         return {
             "frame_count": frame_count,

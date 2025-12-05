@@ -11,6 +11,16 @@ from config import MODEL_PATHS
 from schemas import Detection
 
 
+def clear_gpu_memory():
+    """Clear GPU memory cache to prevent OOM errors."""
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
 def detect_device():
     """
     Auto-detect the best available device.
@@ -113,8 +123,22 @@ class YOLODetector:
         # Convert device string to format YOLO expects (0 for cuda:0, 'cpu' for cpu)
         yolo_device = 0 if self.has_gpu and 'cuda' in self.device else self.device
         
-        # Run inference with device specified
-        results = self.model(image, verbose=False, conf=confidence_threshold, device=yolo_device)
+        # Run inference with device specified (with OOM fallback)
+        try:
+            results = self.model(image, verbose=False, conf=confidence_threshold, device=yolo_device)
+        except torch.cuda.OutOfMemoryError:
+            print("CUDA OOM during detection - clearing cache and retrying...")
+            clear_gpu_memory()
+            # Try again with cleared memory
+            try:
+                results = self.model(image, verbose=False, conf=confidence_threshold, device=yolo_device)
+            except torch.cuda.OutOfMemoryError:
+                # Fall back to CPU
+                print("Still OOM - falling back to CPU")
+                self.has_gpu = False
+                self.device = 'cpu'
+                self.device_name = 'CPU (OOM fallback)'
+                results = self.model(image, verbose=False, conf=confidence_threshold, device='cpu')
         
         detections: List[Detection] = []
         
