@@ -27,8 +27,11 @@ except ImportError:
 FFMPEG_PATH = None
 try:
     import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    print(f"FFmpeg found: {FFMPEG_PATH}")
+    try:
+        FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+        print(f"FFmpeg found: {FFMPEG_PATH}")
+    except Exception as e:
+        print(f"WARNING: ffmpeg not found via imageio-ffmpeg ({e}). Continuing without bundled ffmpeg.")
 except ImportError:
     print("WARNING: imageio-ffmpeg not installed. Run: pip install imageio-ffmpeg")
 
@@ -280,3 +283,4 @@ async def serve_youtube_video(video_id: str):
             "Access-Control-Allow-Headers": "*",
         }
     )
+

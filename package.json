@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"npm run backend\"",
     "dev:frontend": "vite",
-    "backend": "cd backend && pip install -r requirements.txt -q && python main.py",
+    "backend": "cd backend && python setup_and_run.py",
     "build": "vite build",
     "preview": "vite preview",
     "electron": "cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron ./electron/main.js",

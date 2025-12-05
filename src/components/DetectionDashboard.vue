@@ -123,6 +123,8 @@ function clearMedia() {
   detections.value = [];
   errorMsg.value = '';
   annotatedFrameUrl.value = '';
+  isYouTubeVideo.value = false;
+  youtubeUrl.value = '';
 }
 
 async function resetTracker() {
@@ -405,10 +407,13 @@ async function loadYouTube() {
       // Use local video URL (downloaded to server)
       file.value = { type: 'video/mp4', name: data.title || 'youtube_video.mp4' };
       isYouTubeVideo.value = true;
-      previewUrl.value = `${BACKEND_BASE}${data.proxy_url}`;
       youtubeUrl.value = '';
+      annotatedFrameUrl.value = '';
+      detections.value = [];
       
       await resetTracker();
+      
+      previewUrl.value = `${BACKEND_BASE}${data.proxy_url}`;
       loadingMessage.value = '';
     }
   } catch (err) {
@@ -422,6 +427,8 @@ async function loadYouTube() {
 async function handleFile(selectedFile) {
   isYouTubeVideo.value = false;
   if (!selectedFile) return;
+  const isVid = selectedFile.type?.startsWith('video/');
+  const isImg = selectedFile.type?.startsWith('image/');
   
   if (backendStatus.value !== 'online') {
     await checkBackendStatus();
@@ -435,12 +442,13 @@ async function handleFile(selectedFile) {
   await resetTracker();
   
   file.value = selectedFile;
-  previewUrl.value = URL.createObjectURL(selectedFile);
   annotatedFrameUrl.value = '';
   detections.value = [];
   errorMsg.value = '';
   
-  if (isImage.value) {
+  previewUrl.value = URL.createObjectURL(selectedFile);
+  
+  if (isImg) {
     isProcessing.value = true;
     try {
       await new Promise(r => setTimeout(r, 100));
@@ -551,7 +559,7 @@ onBeforeUnmount(() => {
               {{ isDownloading ? 'Downloading...' : 'Load' }}
             </button>
           </div>
-          
+
           <div v-if="isDownloading" class="download-progress">
             <div class="spinner small"></div>
             <span>{{ loadingMessage }}</span>

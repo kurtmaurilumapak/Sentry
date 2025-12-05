@@ -3,11 +3,34 @@
 import os
 from typing import List, Optional
 from PIL import Image
+import torch
 
 from ultralytics import YOLO
 
 from config import MODEL_PATHS
 from schemas import Detection
+
+
+def detect_device():
+    """
+    Auto-detect the best available device.
+    Returns: (device_string, device_name, is_gpu)
+    """
+    # Check for NVIDIA CUDA
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"✓ NVIDIA GPU detected: {gpu_name}")
+        print(f"  CUDA version: {torch.version.cuda}")
+        return 'cuda:0', gpu_name, True
+    
+    # Check for Apple MPS (Metal Performance Shaders)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("✓ Apple Silicon GPU detected (MPS)")
+        return 'mps', 'Apple Silicon', True
+    
+    # Fallback to CPU
+    print("✓ Using CPU")
+    return 'cpu', 'CPU', False
 
 
 class YOLODetector:
@@ -16,6 +39,7 @@ class YOLODetector:
     def __init__(self):
         self.model: Optional[YOLO] = None
         self.model_path: Optional[str] = None
+        self.device, self.device_name, self.has_gpu = detect_device()
     
     def find_model(self) -> Optional[str]:
         """Find the model file from possible locations."""
@@ -38,10 +62,21 @@ class YOLODetector:
             return False
         
         print(f"Loading model from: {self.model_path}")
+        print(f"Using device: {self.device} ({self.device_name})")
         self.model = YOLO(self.model_path)
+        # Ensure model is on the correct device
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'to'):
+            self.model.model.to(self.device)
+            # Verify model is on GPU if CUDA is available
+            if self.has_gpu and torch.cuda.is_available():
+                next_param = next(self.model.model.parameters(), None)
+                if next_param is not None:
+                    device_location = next_param.device
+                    print(f"Model device verified: {device_location}")
         
         print("=" * 50)
         print("MODEL LOADED SUCCESSFULLY")
+        print(f"Device: {self.device_name}")
         print("Available classes:")
         for idx, name in self.model.names.items():
             print(f"  {idx}: {name}")
@@ -55,14 +90,31 @@ class YOLODetector:
             self.load()
         return self.model.names if self.model else {}
     
+    def cleanup(self):
+        """Release model and clear GPU memory."""
+        print("[*] Cleaning up YOLODetector...")
+        self.model = None
+        self.model_path = None
+        
+        if self.has_gpu:
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print("[OK] YOLODetector GPU memory released")
+            except Exception as e:
+                print(f"[WARNING] YOLODetector cleanup error: {e}")
+    
     def detect(self, image: Image.Image, confidence_threshold: float = 0.25) -> List[Detection]:
         """Run detection on an image and return list of Detection objects."""
         if self.model is None:
             if not self.load():
                 return []
         
-        # Run inference
-        results = self.model(image, verbose=False, conf=confidence_threshold)
+        # Convert device string to format YOLO expects (0 for cuda:0, 'cpu' for cpu)
+        yolo_device = 0 if self.has_gpu and 'cuda' in self.device else self.device
+        
+        # Run inference with device specified
+        results = self.model(image, verbose=False, conf=confidence_threshold, device=yolo_device)
         
         detections: List[Detection] = []
         
@@ -96,4 +148,3 @@ class YOLODetector:
 
 # Global detector instance
 detector = YOLODetector()
-

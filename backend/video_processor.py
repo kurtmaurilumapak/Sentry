@@ -8,7 +8,6 @@ import cv2
 import os
 import base64
 import numpy as np
-from pathlib import Path
 import torch
 
 from ultralytics import YOLO
@@ -64,10 +63,43 @@ class VideoProcessor:
         self.device = DEVICE
         self.device_name = DEVICE_NAME
         self.has_gpu = HAS_GPU
+        # Tracking-only mode
+        self.use_tracking = True
+        # Allow tuning image size for low-VRAM GPUs/CPU via env
+        self.gpu_imgsz = int(os.getenv("SENTRY_GPU_IMGSZ", "640"))
+        self.cpu_imgsz = int(os.getenv("SENTRY_CPU_IMGSZ", "480"))
         
         # Load default model
         self.load_model(DEFAULT_MODEL)
-        print(f"Ready on: {self.device_name}")
+        
+        # Warm up GPU with a dummy inference if GPU is available
+        if self.has_gpu and self.model is not None:
+            try:
+                import torch
+                import numpy as np
+                if torch.cuda.is_available():
+                    print("Warming up GPU with dummy inference...")
+                    # Use smaller warmup to avoid OOM on laptop GPUs
+                    dummy_img = np.zeros((320, 320, 3), dtype=np.uint8)
+                    yolo_device = 0 if self.has_gpu and 'cuda' in self.device else self.device
+                    # Run warmup using the same method as actual processing
+                    for _ in range(1):
+                        try:
+                            if self.use_tracking:
+                                _ = self.model.track(dummy_img, verbose=False, device=yolo_device, imgsz=320, half=self.has_gpu)
+                            else:
+                                _ = self.model.predict(dummy_img, verbose=False, device=yolo_device, imgsz=320, half=self.has_gpu)
+                            torch.cuda.synchronize()
+                        except torch.cuda.OutOfMemoryError:
+                            print("GPU warmup skipped (OOM); continuing without warmup")
+                            torch.cuda.empty_cache()
+                            break
+                    print("GPU warmup complete")
+            except Exception as e:
+                print(f"GPU warmup warning: {e}")
+        
+        mode_str = "tracking" if self.use_tracking else "prediction (faster)"
+        print(f"Ready on: {self.device_name} (mode: {mode_str})")
     
     def get_available_models(self):
         """Get list of available models."""
@@ -96,21 +128,88 @@ class VideoProcessor:
             return False
         
         print(f"Loading model: {model_info['name']} from {model_path}")
-        self.model = YOLO(model_path)
+        print(f"Loading on device: {self.device} ({self.device_name})")
+        
+        # Determine device for YOLO (0 for CUDA, 'cpu' for CPU)
+        yolo_device = 0 if self.has_gpu and 'cuda' in self.device else self.device
+        
+        # Load model with explicit device if possible
+        # Some YOLO versions support device in constructor
+        try:
+            # Try loading with device parameter (if supported)
+            self.model = YOLO(model_path)
+        except Exception:
+            self.model = YOLO(model_path)
+        
+        # Move the underlying PyTorch model to GPU immediately
+        if self.has_gpu and torch.cuda.is_available():
+            try:
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'to'):
+                    self.model.model.to(torch.device(self.device))
+                    torch.cuda.synchronize()
+                    
+                    # CRITICAL: Also try to set device on YOLO's predictor if it exists
+                    # This might be the key to forcing GPU usage
+                    if hasattr(self.model, 'predictor') and self.model.predictor is not None:
+                        try:
+                            # Try to set device on predictor's model
+                            if hasattr(self.model.predictor, 'model'):
+                                pred_model = self.model.predictor.model
+                                if hasattr(pred_model, 'to'):
+                                    pred_model.to(torch.device(self.device))
+                        except Exception as e:
+                            print(f"Warning: Could not set predictor device: {e}")
+            except Exception as e:
+                print(f"Warning: Could not move model to GPU: {e}")
+        
+        # Verify model is on GPU
+        if self.has_gpu and torch.cuda.is_available():
+            try:
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'parameters'):
+                    next_param = next(self.model.model.parameters(), None)
+                    if next_param is not None:
+                        actual_device = next_param.device
+                        if actual_device.type == 'cuda':
+                            print(f"Model verified on GPU: {actual_device}")
+                        else:
+                            print(f"WARNING: Model is on {actual_device}, expected GPU!")
+            except Exception as e:
+                print(f"Warning during device verification: {e}")
+        
         self.names = self.model.names
         self.current_model_id = model_id
+        
+        # Verify device if GPU
+        if self.has_gpu and torch.cuda.is_available():
+            print(f"GPU available: {torch.cuda.get_device_name(0)}")
+            memory_allocated = torch.cuda.memory_allocated(0) / 1024**2
+            memory_reserved = torch.cuda.memory_reserved(0) / 1024**2
+            print(f"GPU memory allocated: {memory_allocated:.1f} MB")
+            print(f"GPU memory reserved: {memory_reserved:.1f} MB")
+        
         print(f"Model loaded. Classes: {self.names}")
         return True
-        
-        # Annotation settings (like YOLOSpotlight)
-        self.ann = None
-        self.current_data = None
     
     def reset_tracker(self):
         """Reset the tracker state for a new video."""
         if self.current_model_id:
             self.load_model(self.current_model_id)
             print(f"Tracker reset (model: {self.current_model_id})")
+    
+    def cleanup(self):
+        """Release model and clear GPU memory."""
+        print("[*] Cleaning up VideoProcessor...")
+        self.model = None
+        self.names = {}
+        self.current_model_id = None
+        
+        if self.has_gpu:
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print("[OK] VideoProcessor GPU memory released")
+            except Exception as e:
+                print(f"[WARNING] VideoProcessor cleanup error: {e}")
     
     def get_device_info(self):
         """Get current device information."""
@@ -120,7 +219,7 @@ class VideoProcessor:
             'has_gpu': self.has_gpu
         }
     
-    def process_frame(self, im0: np.ndarray, conf: float = 0.25) -> tuple:
+    def process_frame(self, im0: np.ndarray, conf: float = 0.25, imgsz_override: int = None) -> tuple:
         """
         Process a single frame with YOLO tracking.
         Auto-optimized for GPU or CPU.
@@ -129,18 +228,37 @@ class VideoProcessor:
             return im0, []
         
         # Use larger size for GPU, smaller for CPU
-        imgsz = 640 if self.has_gpu else 480
+        imgsz = imgsz_override if imgsz_override else (self.gpu_imgsz if self.has_gpu else self.cpu_imgsz)
+
+        # YOLO device format: 0 for CUDA GPU, 'cpu' for CPU/MPS
+        yolo_device = 0 if (self.has_gpu and 'cuda' in str(self.device)) else self.device
         
-        # Object tracking with device-optimized settings
-        results = self.model.track(
-            im0, 
-            persist=True, 
-            conf=conf, 
-            verbose=False,
-            imgsz=imgsz,
-            device=self.device,
-            half=self.has_gpu  # FP16 for GPU acceleration
-        )
+        try:
+            # Object tracking with device-optimized settings
+            results = self.model.track(
+                im0, 
+                persist=True, 
+                conf=conf, 
+                verbose=False,
+                imgsz=imgsz,
+                device=yolo_device,
+                half=self.has_gpu  # FP16 for GPU acceleration
+            )
+        except torch.cuda.OutOfMemoryError:
+            # Graceful fallback for low-VRAM GPUs
+            print("CUDA OOM during track(); falling back to CPU with smaller image size")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            self.has_gpu = False
+            self.device = 'cpu'
+            self.device_name = 'CPU (OOM fallback)'
+            # Reload model on CPU to avoid device mismatch
+            if self.current_model_id:
+                self.load_model(self.current_model_id)
+            # Retry on CPU
+            return self.process_frame(im0, conf=conf, imgsz_override=self.cpu_imgsz)
         
         detections = []
         
